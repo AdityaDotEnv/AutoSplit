@@ -1,12 +1,21 @@
 Flask==2.3.3
+Flask-Cors==4.0.0
 Flask-SQLAlchemy==3.0.5
 Flask-Migrate==4.0.4
-pytesseract==0.3.13
-Pillow==10.4.0
-python-dotenv==1.0.0
-spacy==3.6.0
-gunicorn==20.1.0
-stripe==5.0.0
-Flask-SocketIO==6.5.2
+
+# Socket & scheduling
+Flask-SocketIO==5.5.1
 eventlet==0.33.3
 APScheduler==3.10.1
+
+# OCR/NLP
+numpy==1.24.4          # <-- pin to avoid NumPy 2.x ABI break
+spacy==3.6.0
+thinc==8.1.12          # <-- compatible with spaCy 3.6
+pytesseract==0.3.13
+Pillow==9.5.0
+
+# Config / web
+python-dotenv==1.0.0
+gunicorn==20.1.0
+stripe==5.0.0

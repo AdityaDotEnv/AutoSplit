@@ -5,8 +5,21 @@ export default function GroupPage({onCreate}){
   const [name, setName] = useState('');
   const [members, setMembers] = useState([{name:'Alice'},{name:'Bob'}]);
 
-  function addMember(){ setMembers([...members, {name:''}]); }
-  function setMemberName(i, val){ const m = [...members]; m[i].name = val; setMembers(m); }
+  function addMember(){ 
+    setMembers([...members, {name:''}]);
+  }
+
+  function setMemberName(i, val){ 
+    const m = [...members]; 
+    m[i].name = val; 
+    setMembers(m); 
+  }
+
+  function removeMember(index) {
+    if (members.length > 1) {
+      setMembers(members.filter((_, i) => i !== index));
+    }
+  }
 
   async function create(){
     const res = await API.post('/groups', {name, members});
@@ -14,18 +27,67 @@ export default function GroupPage({onCreate}){
   }
 
   return (
-    <div style={{border:'1px solid #ddd', padding:16, borderRadius:8, maxWidth:600}}>
-      <h3>Create a Group</h3>
-      <input value={name} onChange={e=>setName(e.target.value)} placeholder="Group name" />
-      <h4>Members</h4>
-      {members.map((m,i)=>(
-        <div key={i}>
-          <input placeholder="name" value={m.name} onChange={e=>setMemberName(i, e.target.value)} />
+    <div className="group-creation-container">
+      <div className="group-creation-card">
+        <div className="creation-header">
+          <h2>Create New Group</h2>
+          <p>Start by creating a group and adding members</p>
         </div>
-      ))}
-      <button onClick={addMember}>Add member</button>
-      <div style={{marginTop:10}}>
-        <button onClick={create}>Create Group</button>
+
+        <div className="form-group">
+          <label className="form-label">Group Name</label>
+          <input 
+            className="form-input"
+            value={name} 
+            onChange={e => setName(e.target.value)} 
+            placeholder="Enter group name" 
+          />
+        </div>
+
+        <div className="members-section">
+          <div className="section-header">
+            <h3>Group Members</h3>
+            <button 
+              type="button"
+              className="add-member-btn"
+              onClick={addMember}
+            >
+              <span>+</span>
+              Add Member
+            </button>
+          </div>
+
+          <div className="members-grid">
+            {members.map((m,i) => (
+              <div key={i} className="member-input-group">
+                <input 
+                  className="member-input"
+                  placeholder="Member name" 
+                  value={m.name} 
+                  onChange={e => setMemberName(i, e.target.value)} 
+                />
+                {members.length > 1 && (
+                  <button
+                    type="button"
+                    className="remove-member-btn"
+                    onClick={() => removeMember(i)}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <button 
+          className="create-group-btn"
+          onClick={create}
+          disabled={!name.trim() || members.some(m => !m.name.trim())}
+        >
+          Create Group
+          <span className="btn-arrow">→</span>
+        </button>
       </div>
     </div>
   );
