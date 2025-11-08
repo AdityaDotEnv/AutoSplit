@@ -44,7 +44,7 @@
 
   1. **Clone the repository**
      ```bash
-     git clone https://github.com/<your-username>/autosplit.git
+     git clone https://github.com/AdityaDotEnv/AutoSplit.git
      cd autosplit
      ```
 
