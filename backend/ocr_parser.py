@@ -1,9 +1,17 @@
-from PIL import Image
 import os
 import re
+from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass, field
+
 import cv2
 import numpy as np
-from paddleocr import PaddleOCR
+import paddle
+from PIL import Image
+
+# Fix for OneDnnContext error on Windows - must be set before OCR initialization
+os.environ["PADDLE_WITH_MKLDNN"] = "OFF"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_onednn_fused_op"] = "0"
 
 _METADATA_KEYWORDS = [
     "invoice",
@@ -52,11 +60,112 @@ _ocr = None
 def _get_ocr():
     global _ocr
     if _ocr is None:
-        _ocr = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=False, show_log=False)
+        try:
+            from paddleocr import PaddleOCR
+
+            _ocr = PaddleOCR(
+                use_angle_cls=True,
+                lang="en",
+                use_gpu=False,
+                show_log=False,
+                enable_mkldnn=False,
+            )
+        except Exception as e:
+            print(f"Failed to initialize PaddleOCR: {e}")
+            import traceback
+            traceback.print_exc()
+            _ocr = False
     return _ocr
 
 
-def _is_metadata_line(line):
+@dataclass
+class OCRResult:
+    """OCR result with null safety."""
+
+    text: str = ""
+    is_valid: bool = False
+    error: Optional[str] = None
+
+    @classmethod
+    def success(cls, text: str) -> "OCRResult":
+        valid = bool(text and text.strip())
+        return cls(
+            text=text, is_valid=valid, error=None if valid else "Empty OCR result"
+        )
+
+    @classmethod
+    def failure(cls, error: str) -> "OCRResult":
+        return cls(text="", is_valid=False, error=error)
+
+
+@dataclass
+class ExtractedItem:
+    """Schema-validated extracted item."""
+
+    description: str = "(item)"
+    price: Optional[float] = None
+    raw_line: str = ""
+    is_valid: bool = False
+    validation_errors: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ExtractedItem":
+        errors = []
+        desc = data.get("description")
+        price = data.get("price")
+        raw = data.get("raw_line", "")
+
+        if desc is None or not isinstance(desc, str):
+            desc = "(item)"
+        else:
+            desc = cls._sanitize_description(desc)
+            if not desc:
+                errors.append("Invalid description")
+
+        if price is None:
+            errors.append("Price is None")
+        else:
+            price = cls._validate_price(price)
+            if price is None:
+                errors.append("Invalid price value")
+            elif price <= 0 or price > 1000000:
+                errors.append("Price out of range (0-1000000)")
+
+        is_valid = len(errors) == 0 and price is not None
+        return cls(
+            description=desc or "(item)",
+            price=price,
+            raw_line=raw,
+            is_valid=is_valid,
+            validation_errors=errors,
+        )
+
+    @staticmethod
+    def _sanitize_description(text: str) -> Optional[str]:
+        if not text or not isinstance(text, str):
+            return None
+        s = text.strip()
+        s = re.sub(r"^[\s\$\€\₹\£]+", "", s)
+        s = re.sub(r"^\d+[\.\)\-]\s*", "", s)
+        s = s.strip()
+        return s if s else None
+
+    @staticmethod
+    def _validate_price(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            val = float(value)
+            if val <= 0 or val > 1000000:
+                return None
+            return round(val, 2)
+        except (TypeError, ValueError):
+            return None
+
+
+def _is_metadata_line(line: str) -> bool:
+    if not line:
+        return False
     low = line.lower()
     for k in _METADATA_KEYWORDS:
         if k in low:
@@ -68,37 +177,40 @@ def _is_metadata_line(line):
     return False
 
 
-def _normalize_number_token(tok, context_numbers=None):
+def _normalize_number_token(
+    tok: str, context_numbers: List[float] = None
+) -> Optional[float]:
     if not tok or not re.search(r"\d", tok):
         return None
 
     s = tok.strip()
     s = re.sub(r"[^\d,.\-]", "", s)
+    if not s:
+        return None
 
-    if "." in s and "," in s:
+    has_dot = "." in s
+    has_comma = "," in s
+
+    if has_dot and has_comma:
         if s.rfind(".") > s.rfind(","):
-            dec = "."
-            thou = ","
+            s = s.replace(",", "")
         else:
-            dec = ","
-            thou = "."
-        s = s.replace(thou, "")
-        s = s.replace(dec, ".")
-    else:
-        if "," in s and "." not in s:
-            parts = s.split(",")
-            if len(parts[-1]) == 2:
-                s = s.replace(",", ".")
-            elif len(parts[-1]) == 3 and len(parts) > 1:
-                s = "".join(parts)
-            else:
-                s = s.replace(",", ".")
-        elif "." in s and "," not in s:
-            parts = s.split(".")
-            if len(parts[-1]) <= 2:
-                pass
-            else:
-                s = "".join(parts)
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+    elif has_comma and not has_dot:
+        parts = s.split(",")
+        if len(parts[-1]) == 2:
+            s = s.replace(",", ".")
+        elif len(parts[-1]) == 3 and len(parts) > 1:
+            s = "".join(parts)
+        else:
+            s = s.replace(",", ".")
+    elif has_dot and not has_comma:
+        parts = s.split(".")
+        if len(parts[-1]) <= 2:
+            pass
+        else:
+            s = "".join(parts)
 
     s = s.strip(".")
     if not re.fullmatch(r"\d+(\.\d+)?", s):
@@ -108,7 +220,7 @@ def _normalize_number_token(tok, context_numbers=None):
 
     if "." in s:
         try:
-            return float(s)
+            return round(float(s), 2)
         except:
             return None
 
@@ -119,27 +231,34 @@ def _normalize_number_token(tok, context_numbers=None):
 
     length = len(s)
     if length <= 3:
-        return float(val)
+        return round(float(val), 2)
+
     if context_numbers:
-        if any(
-            isinstance(x, float) and not float(x).is_integer() for x in context_numbers
-        ):
-            return float(val) / 100.0
+        if any(isinstance(x, float) and not x.is_integer() for x in context_numbers):
+            return round(float(val) / 100.0, 2)
+
     if length >= 5:
-        return float(val) / 100.0
+        return round(float(val) / 100.0, 2)
 
-    return float(val)
+    return round(float(val), 2)
 
 
-def image_to_text(image_path, psm=None, oem=None):
+def image_to_text(image_path: str, psm: int = None, oem: int = None) -> OCRResult:
     """
     Load image and run PaddleOCR with preprocessing.
+    Returns OCRResult with null-safe handling.
     """
+    if not image_path or not os.path.exists(image_path):
+        return OCRResult.failure("Invalid image path or file not found")
+
     try:
         img = cv2.imread(image_path)
         if img is None:
-            img = Image.open(image_path)
-            img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            try:
+                pil_img = Image.open(image_path)
+                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                return OCRResult.failure(f"Cannot read image: {e}")
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
@@ -147,11 +266,22 @@ def image_to_text(image_path, psm=None, oem=None):
             gray, None, h=10, templateWindowSize=7, searchWindowSize=21
         )
 
-        ocr = _get_ocr()
-        result = ocr.ocr(denoised, cls=True)
+        ocr_engine = _get_ocr()
+        if not ocr_engine:
+            return OCRResult.failure("PaddleOCR not available")
+
+        try:
+            result = ocr_engine.ocr(denoised, cls=False)
+        except Exception as e:
+            print(f"OCR failed on denoised image, retrying on original: {e}")
+            try:
+                result = ocr_engine.ocr(img, cls=False)
+            except Exception as e2:
+                print(f"OCR failed on original image as well: {e2}")
+                return OCRResult.failure(f"PaddleOCR internal error: {e2}")
 
         if not result or not result[0]:
-            return ""
+            return OCRResult.failure("No text detected")
 
         lines = []
         for line in result[0]:
@@ -164,18 +294,22 @@ def image_to_text(image_path, psm=None, oem=None):
                 if text:
                     lines.append(text)
 
-        return "\n".join(lines)
+        if not lines:
+            return OCRResult.failure("No text lines extracted")
+
+        return OCRResult.success("\n".join(lines))
+
     except Exception as e:
-        print("OCR Error:", e)
-        return ""
+        print(f"OCR processing error: {e}")
+        return OCRResult.failure(f"OCR processing error: {e}")
 
 
-def extract_lines_with_prices(raw_text):
+def extract_lines_with_prices(raw_text: str) -> List[ExtractedItem]:
     """
     Parse raw OCR text and extract item-like lines + prices.
-    Returns list of dicts: {'description': str, 'price': float, 'raw_line': str}
+    Returns list of ExtractedItem with validation.
     """
-    if not raw_text:
+    if not raw_text or not raw_text.strip():
         return []
 
     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
@@ -185,8 +319,12 @@ def extract_lines_with_prices(raw_text):
     for ln in lines:
         for m in _NUM_TOKEN_RE.finditer(ln):
             tok = m.group("num")
-            cleaned = tok.replace(" ", "")
-            cleaned = cleaned.replace("₹", "").replace("Rs", "").replace("INR", "")
+            cleaned = (
+                tok.replace(" ", "")
+                .replace("₹", "")
+                .replace("Rs", "")
+                .replace("INR", "")
+            )
             if "," in cleaned and "." in cleaned:
                 if cleaned.rfind(".") > cleaned.rfind(","):
                     cleaned = cleaned.replace(",", "")
@@ -219,7 +357,7 @@ def extract_lines_with_prices(raw_text):
         if not chosen:
             continue
 
-        price = _normalize_number_token(chosen, context_numbers or None)
+        price = _normalize_number_token(chosen, context_numbers)
         if price is None:
             continue
 
@@ -230,12 +368,9 @@ def extract_lines_with_prices(raw_text):
         if price <= 0 or price > 1000000:
             continue
 
-        results.append(
-            {
-                "description": desc if desc else "(item)",
-                "price": round(price, 2),
-                "raw_line": ln,
-            }
+        item = ExtractedItem.from_dict(
+            {"description": desc if desc else "(item)", "price": price, "raw_line": ln}
         )
+        results.append(item)
 
     return results

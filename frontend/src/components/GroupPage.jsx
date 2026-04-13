@@ -21,9 +21,22 @@ export default function GroupPage({onCreate}){
     }
   }
 
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
   async function create(){
-    const res = await API.post('/groups', {name, members});
-    onCreate({id: res.data.id, name: res.data.name});
+    if (!name.trim()) return;
+    try {
+      setLoading(true);
+      setError('');
+      const res = await API.post('/groups', {name, members});
+      onCreate({id: res.data.id, name: res.data.name});
+    } catch (e) {
+      console.error(e);
+      setError('Failed to create group. Is the backend running?');
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -80,12 +93,14 @@ export default function GroupPage({onCreate}){
           </div>
         </div>
 
+        {error && <div className="error-message" style={{marginBottom: '1rem'}}>{error}</div>}
+
         <button 
           className="create-group-btn"
           onClick={create}
-          disabled={!name.trim() || members.some(m => !m.name.trim())}
+          disabled={loading || !name.trim() || members.some(m => !m.name.trim())}
         >
-          Create Group
+          {loading ? 'Creating...' : 'Create Group'}
           <span className="btn-arrow">→</span>
         </button>
       </div>

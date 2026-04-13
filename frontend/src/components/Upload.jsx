@@ -102,16 +102,16 @@ export default function Upload({ group }) {
             )}
           </div>
         </div>
-        
-        {/* Hidden file input */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*,application/pdf"
-          onChange={handleFileSelect}
-          className="file-input-hidden"
-        />
       </div>
+
+      {/* Hidden file input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*,application/pdf"
+        onChange={handleFileSelect}
+        className="file-input-hidden"
+      />
 
       {file && (
         <div className="file-preview">

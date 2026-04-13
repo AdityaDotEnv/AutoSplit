@@ -1,7 +1,14 @@
 import os
 import traceback
+import paddle
 from datetime import datetime, timedelta
+
+# Enforce Paddle stability flags before other imports
+os.environ["PADDLE_WITH_MKLDNN"] = "OFF"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_onednn_fused_op"] = "0"
 from collections import defaultdict
+from typing import Optional, List, Dict, Any
 
 from flask import Flask, request, jsonify
 from flask_migrate import Migrate
@@ -11,12 +18,16 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from models import db, Group, Member, Bill, Item, ItemAssignment
 from config import Config
-from ocr_parser import image_to_text, extract_lines_with_prices
-from nlp_parser import find_total_amount, detect_person_item_relations
+from ocr_parser import (
+    image_to_text,
+    extract_lines_with_prices,
+    OCRResult,
+    ExtractedItem,
+)
+from nlp_parser import find_total_amount, detect_person_item_relations, ValidationResult
 from payments import create_stripe_payment_intent, venmo_deeplink, upi_deeplink
 
 
-# ---------- Setup ----------
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -24,16 +35,16 @@ app = Flask(__name__)
 app.config.from_object(Config)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# ✅ Proper global CORS configuration
 CORS(
     app,
-    resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}},
+    resources={
+        r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}
+    },
     supports_credentials=True,
     methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# ---------- Extensions ----------
 db.init_app(app)
 migrate = Migrate(app, db)
 socketio = SocketIO(
@@ -43,27 +54,32 @@ socketio = SocketIO(
     engineio_logger=True,
 )
 
-# ---------- Health Check ----------
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
 
-# ---------- GROUP CREATION ----------
 @app.route("/api/groups", methods=["POST"])
 def create_group():
     data = request.json or {}
     name = data.get("name", "My Group")
     members = data.get("members", [])
 
-    g = Group(name=name)
+    if not name or not isinstance(name, str) or not name.strip():
+        return jsonify({"error": "Invalid group name"}), 400
+
+    g = Group(name=name.strip())
     db.session.add(g)
     db.session.commit()
 
     for m in members:
+        mem_name = m.get("name")
+        if not mem_name or not isinstance(mem_name, str) or not mem_name.strip():
+            continue
         mem = Member(
             group_id=g.id,
-            name=m.get("name"),
+            name=mem_name.strip(),
             upi_id=m.get("upi_id"),
             venmo_id=m.get("venmo_id"),
         )
@@ -73,7 +89,6 @@ def create_group():
     return jsonify({"id": g.id, "name": g.name})
 
 
-# ---------- GROUP RETRIEVAL ----------
 @app.route("/api/groups/<group_id>", methods=["GET"])
 def get_group(group_id):
     g = Group.query.get_or_404(group_id)
@@ -94,7 +109,6 @@ def get_group(group_id):
     )
 
 
-# ---------- BILL UPLOAD ----------
 @app.route("/api/upload", methods=["POST"])
 def upload_bill():
     try:
@@ -108,45 +122,74 @@ def upload_bill():
         path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         f.save(path)
 
-        # OCR + NLP pipeline
-        text = image_to_text(path)
-        items = extract_lines_with_prices(text)
-        total = find_total_amount(text)
-        parsed_assignments = detect_person_item_relations(items, text)
+        ocr_result = image_to_text(path)
+        if not ocr_result.is_valid or not ocr_result.text:
+            print(f"OCR Failed for {filename}. Error: {ocr_result.error}")
+            return jsonify(
+                {
+                    "error": "OCR failed",
+                    "details": ocr_result.error or "No text detected",
+                }
+            ), 422
 
-        bill = Bill(group_id=group_id, raw_text=text, total_amount=total)
+        raw_text = ocr_result.text
+        items = extract_lines_with_prices(raw_text)
+
+        total_result = find_total_amount(raw_text)
+        total_amount = total_result.value if total_result.is_valid else None
+
+        item_dicts = [
+            {"description": it.description, "price": it.price, "raw_line": it.raw_line}
+            for it in items
+        ]
+        parsed_assignments = detect_person_item_relations(item_dicts, raw_text)
+
+        bill = Bill(group_id=group_id, raw_text=raw_text, total_amount=total_amount)
         db.session.add(bill)
         db.session.commit()
 
+        db_items = []
+        valid_item_count = 0
         for it in items:
-            item = Item(bill_id=bill.id, description=it["description"], price=it["price"])
-            db.session.add(item)
+            if it.is_valid and it.price is not None:
+                item = Item(bill_id=bill.id, description=it.description, price=it.price)
+                db.session.add(item)
+                db.session.flush()
+                db_items.append(item)
+                valid_item_count += 1
+            else:
+                db_items.append(None) # Placeholder for invalid items
+
         db.session.commit()
 
         return jsonify(
             {
                 "bill_id": bill.id,
-                "raw_text": text,
-                "total": total,
+                "raw_text": raw_text,
+                "total": total_amount,
+                "total_valid": total_result.is_valid,
+                "total_error": total_result.errors[0] if total_result.errors else None,
                 "items": [
                     {
-                        "id": it.id,
+                        "id": db_item.id if db_item else None,
                         "description": it.description,
                         "price": it.price,
+                        "is_valid": it.is_valid,
+                        "validation_errors": it.validation_errors,
                     }
-                    for it in bill.items
+                    for it, db_item in zip(items, db_items)
                 ],
+                "valid_item_count": valid_item_count,
                 "auto_matches": parsed_assignments,
             }
         )
 
     except Exception as e:
-        print("❌ Upload error:", e)
+        print("Upload error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
-# ---------- ITEM ASSIGNMENT ----------
 @app.route("/api/assign", methods=["POST"])
 def assign_items():
     try:
@@ -159,12 +202,24 @@ def assign_items():
 
         per_item = defaultdict(list)
         for a in raw:
+            item_id = a.get("item_id")
+            member_id = a.get("member_id")
+            share = a.get("share")
+
+            if not item_id or not isinstance(item_id, str):
+                continue
+            if not member_id or not isinstance(member_id, str):
+                continue
+            if share is None:
+                continue
+
             try:
-                item_id = str(a["item_id"])
-                member_id = str(a["member_id"])
-                share = float(a.get("share") or 0.0)
-            except (KeyError, ValueError, TypeError):
-                return jsonify({"error": f"Bad assignment payload: {a}"}), 400
+                share = float(share)
+                if share < 0:
+                    continue
+            except (ValueError, TypeError):
+                continue
+
             per_item[item_id].append({"member_id": member_id, "share": share})
 
         results = []
@@ -208,7 +263,9 @@ def assign_items():
                     amounts[0] = round(amounts[0] + diff, 2)
 
             for a, amt in zip(assigns, amounts):
-                ia = ItemAssignment(item_id=item_id, member_id=a["member_id"], share=amt)
+                ia = ItemAssignment(
+                    item_id=item_id, member_id=a["member_id"], share=amt
+                )
                 db.session.add(ia)
                 results.append(
                     {"item_id": item_id, "member_id": a["member_id"], "share": amt}
@@ -222,13 +279,10 @@ def assign_items():
         return jsonify({"error": str(e)}), 500
 
 
-# ---------- GROUP SUMMARY ----------
 @app.route("/api/group/<group_id>/summary", methods=["GET"])
 def group_summary(group_id):
     g = Group.query.get_or_404(group_id)
-    members = {
-        m.id: {"id": m.id, "name": m.name, "total_owed": 0.0} for m in g.members
-    }
+    members = {m.id: {"id": m.id, "name": m.name, "total_owed": 0.0} for m in g.members}
     bills = Bill.query.filter_by(group_id=group_id).all()
 
     for b in bills:
@@ -242,32 +296,68 @@ def group_summary(group_id):
     return jsonify({"members": list(members.values()), "bill_count": len(bills)})
 
 
-# ---------- PAYMENTS ----------
 @app.route("/api/pay/upi", methods=["POST"])
 def pay_upi():
-    data = request.json
-    payee_upi = data["upi"]
+    data = request.json or {}
+    payee_upi = data.get("upi")
     payee_name = data.get("name", "Friend")
-    amount = float(data["amount"])
+    amount = data.get("amount")
+
+    if not payee_upi or not isinstance(payee_upi, str):
+        return jsonify({"error": "Missing or invalid upi_id"}), 400
+    if amount is None:
+        return jsonify({"error": "Missing amount"}), 400
+
+    try:
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid amount"}), 400
+
     link = upi_deeplink(payee_upi, payee_name, amount)
     return jsonify({"upi_link": link})
 
 
 @app.route("/api/pay/venmo", methods=["POST"])
 def pay_venmo():
-    data = request.json
-    venmo_id = data["venmo_id"]
-    amount = float(data["amount"])
+    data = request.json or {}
+    venmo_id = data.get("venmo_id")
+    amount = data.get("amount")
     note = data.get("note", "AutoSplit")
+
+    if not venmo_id or not isinstance(venmo_id, str):
+        return jsonify({"error": "Missing or invalid venmo_id"}), 400
+    if amount is None:
+        return jsonify({"error": "Missing amount"}), 400
+
+    try:
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid amount"}), 400
+
     link = venmo_deeplink(venmo_id, amount, note)
     return jsonify({"venmo_link": link})
 
 
 @app.route("/api/pay/stripe", methods=["POST"])
 def pay_stripe():
-    data = request.json
-    amount = float(data["amount"])
+    data = request.json or {}
+    amount = data.get("amount")
     desc = data.get("description", "AutoSplit payment")
+
+    if amount is None:
+        return jsonify({"error": "Missing amount"}), 400
+
+    try:
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid amount"}), 400
+
     intent = create_stripe_payment_intent(amount, currency="inr", description=desc)
     return jsonify(
         {
@@ -277,7 +367,6 @@ def pay_stripe():
     )
 
 
-# ---------- SOCKET.IO ----------
 @socketio.on("join")
 def on_join(data):
     room = data.get("group")
@@ -291,7 +380,6 @@ def handle_message(data):
     emit("message", data, room=room)
 
 
-# ---------- Scheduler ----------
 def monthly_summary_job():
     with app.app_context():
         cutoff = datetime.utcnow() - timedelta(days=30)
@@ -308,8 +396,7 @@ scheduler.add_job(monthly_summary_job, "interval", days=1)
 scheduler.start()
 
 
-# ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Server running at http://0.0.0.0:{port}")
+    print(f"Server running at http://0.0.0.0:{port}")
     socketio.run(app, host="0.0.0.0", port=port, debug=True)
