@@ -127,23 +127,25 @@ export default function Upload({ group }) {
         </div>
       )}
 
-      <button
-        onClick={upload}
-        disabled={loading || !file}
-        className="upload-btn"
-      >
-        {loading ? (
-          <>
-            <div className="spinner"></div>
-            Processing...
-          </>
-        ) : (
-          <>
-            <span>⚡</span>
-            Upload & Parse Bill
-          </>
-        )}
-      </button>
+      <div className="center-action">
+        <button
+          onClick={upload}
+          disabled={loading || !file}
+          className="upload-btn"
+        >
+          {loading ? (
+            <>
+              <div className="spinner"></div>
+              Processing...
+            </>
+          ) : (
+            <>
+              <span>⚡</span>
+              Upload & Parse Bill
+            </>
+          )}
+        </button>
+      </div>
 
       {error && <div className="error-message">{error}</div>}
 

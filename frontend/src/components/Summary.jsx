@@ -104,9 +104,14 @@ export default function Summary({ group, refreshToken = 0 }) {
                 <Tooltip 
                   formatter={(value) => [`₹${value}`, 'Amount']}
                   contentStyle={{
-                    background: 'var(--surface)',
-                    border: '1px solid var(--border)',
-                    borderRadius: 'var(--radius)',
+                    background: '#ffffff',
+                    border: '1px solid #f2f2f2',
+                    borderRadius: '12px',
+                    boxShadow: '0 4px 12px rgba(0,0,0,0.05)',
+                  }}
+                  itemStyle={{
+                    color: '#000000',
+                    fontFamily: 'var(--font-body)',
                   }}
                 />
                 <Legend />
