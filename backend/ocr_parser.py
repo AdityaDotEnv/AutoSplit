@@ -1,377 +1,77 @@
 import os
-import re
-from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass, field
-
 import cv2
 import numpy as np
-import paddle
-from PIL import Image
+from rapidocr_onnxruntime import RapidOCR
 
-# Fix for OneDnnContext error on Windows - must be set before OCR initialization
-os.environ["PADDLE_WITH_MKLDNN"] = "OFF"
-os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["FLAGS_enable_onednn_fused_op"] = "0"
+ocr_engine = RapidOCR()
 
-_METADATA_KEYWORDS = [
-    "invoice",
-    "invoice no",
-    "invoice#",
-    "bill no",
-    "bill#",
-    "date",
-    "time",
-    "gst",
-    "tax",
-    "subtotal",
-    "total due",
-    "amount due",
-    "amount",
-    "phone",
-    "tel",
-    "mobile",
-    "order no",
-    "order#",
-    "qty",
-    "quantity",
-    "id",
-    "cash",
-    "card",
-    "paid",
-    "change",
-    "receipt",
-    "taxable",
-    "vat",
-    "tin",
-    "gstin",
-    "merchant",
-    "address",
-    "email",
-]
-
-_NUM_TOKEN_RE = re.compile(
-    r"(?P<sym>₹|\$|€|Rs\.?|INR)?\s*(?P<num>[0-9][0-9\.,]{0,20}[0-9])"
-)
-_RIGHTMOST_NUM_RE = re.compile(r"([0-9][0-9\.,]{0,20}[0-9])\s*$")
-
-_ocr = None
-
-
-def _get_ocr():
-    global _ocr
-    if _ocr is None:
-        try:
-            from paddleocr import PaddleOCR
-
-            _ocr = PaddleOCR(
-                use_angle_cls=True,
-                lang="en",
-                use_gpu=False,
-                show_log=False,
-                enable_mkldnn=False,
-            )
-        except Exception as e:
-            print(f"Failed to initialize PaddleOCR: {e}")
-            import traceback
-            traceback.print_exc()
-            _ocr = False
-    return _ocr
-
-
-@dataclass
-class OCRResult:
-    """OCR result with null safety."""
-
-    text: str = ""
-    is_valid: bool = False
-    error: Optional[str] = None
-
-    @classmethod
-    def success(cls, text: str) -> "OCRResult":
-        valid = bool(text and text.strip())
-        return cls(
-            text=text, is_valid=valid, error=None if valid else "Empty OCR result"
-        )
-
-    @classmethod
-    def failure(cls, error: str) -> "OCRResult":
-        return cls(text="", is_valid=False, error=error)
-
-
-@dataclass
-class ExtractedItem:
-    """Schema-validated extracted item."""
-
-    description: str = "(item)"
-    price: Optional[float] = None
-    raw_line: str = ""
-    is_valid: bool = False
-    validation_errors: List[str] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "ExtractedItem":
-        errors = []
-        desc = data.get("description")
-        price = data.get("price")
-        raw = data.get("raw_line", "")
-
-        if desc is None or not isinstance(desc, str):
-            desc = "(item)"
-        else:
-            desc = cls._sanitize_description(desc)
-            if not desc:
-                errors.append("Invalid description")
-
-        if price is None:
-            errors.append("Price is None")
-        else:
-            price = cls._validate_price(price)
-            if price is None:
-                errors.append("Invalid price value")
-            elif price <= 0 or price > 1000000:
-                errors.append("Price out of range (0-1000000)")
-
-        is_valid = len(errors) == 0 and price is not None
-        return cls(
-            description=desc or "(item)",
-            price=price,
-            raw_line=raw,
-            is_valid=is_valid,
-            validation_errors=errors,
-        )
-
-    @staticmethod
-    def _sanitize_description(text: str) -> Optional[str]:
-        if not text or not isinstance(text, str):
-            return None
-        s = text.strip()
-        s = re.sub(r"^[\s\$\€\₹\£]+", "", s)
-        s = re.sub(r"^\d+[\.\)\-]\s*", "", s)
-        s = s.strip()
-        return s if s else None
-
-    @staticmethod
-    def _validate_price(value: Any) -> Optional[float]:
-        if value is None:
-            return None
-        try:
-            val = float(value)
-            if val <= 0 or val > 1000000:
-                return None
-            return round(val, 2)
-        except (TypeError, ValueError):
-            return None
-
-
-def _is_metadata_line(line: str) -> bool:
-    if not line:
-        return False
-    low = line.lower()
-    for k in _METADATA_KEYWORDS:
-        if k in low:
-            return True
-    if re.search(r"[/\\\-]{1,}", line) and re.search(r"\d", line):
-        return True
-    if re.search(r"\d{8,}", line):
-        return True
-    return False
-
-
-def _normalize_number_token(
-    tok: str, context_numbers: List[float] = None
-) -> Optional[float]:
-    if not tok or not re.search(r"\d", tok):
-        return None
-
-    s = tok.strip()
-    s = re.sub(r"[^\d,.\-]", "", s)
-    if not s:
-        return None
-
-    has_dot = "." in s
-    has_comma = "," in s
-
-    if has_dot and has_comma:
-        if s.rfind(".") > s.rfind(","):
-            s = s.replace(",", "")
-        else:
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
-    elif has_comma and not has_dot:
-        parts = s.split(",")
-        if len(parts[-1]) == 2:
-            s = s.replace(",", ".")
-        elif len(parts[-1]) == 3 and len(parts) > 1:
-            s = "".join(parts)
-        else:
-            s = s.replace(",", ".")
-    elif has_dot and not has_comma:
-        parts = s.split(".")
-        if len(parts[-1]) <= 2:
-            pass
-        else:
-            s = "".join(parts)
-
-    s = s.strip(".")
-    if not re.fullmatch(r"\d+(\.\d+)?", s):
-        s = re.sub(r"[^\d\.]", "", s)
-    if not s:
-        return None
-
-    if "." in s:
-        try:
-            return round(float(s), 2)
-        except:
-            return None
-
-    try:
-        val = int(s)
-    except:
-        return None
-
-    length = len(s)
-    if length <= 3:
-        return round(float(val), 2)
-
-    if context_numbers:
-        if any(isinstance(x, float) and not x.is_integer() for x in context_numbers):
-            return round(float(val) / 100.0, 2)
-
-    if length >= 5:
-        return round(float(val) / 100.0, 2)
-
-    return round(float(val), 2)
-
-
-def image_to_text(image_path: str, psm: int = None, oem: int = None) -> OCRResult:
-    """
-    Load image and run PaddleOCR with preprocessing.
-    Returns OCRResult with null-safe handling.
-    """
-    if not image_path or not os.path.exists(image_path):
-        return OCRResult.failure("Invalid image path or file not found")
-
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            try:
-                pil_img = Image.open(image_path)
-                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-            except Exception as e:
-                return OCRResult.failure(f"Cannot read image: {e}")
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        denoised = cv2.fastNlMeansDenoising(
-            gray, None, h=10, templateWindowSize=7, searchWindowSize=21
-        )
-
-        ocr_engine = _get_ocr()
-        if not ocr_engine:
-            return OCRResult.failure("PaddleOCR not available")
-
-        try:
-            result = ocr_engine.ocr(denoised, cls=False)
-        except Exception as e:
-            print(f"OCR failed on denoised image, retrying on original: {e}")
-            try:
-                result = ocr_engine.ocr(img, cls=False)
-            except Exception as e2:
-                print(f"OCR failed on original image as well: {e2}")
-                return OCRResult.failure(f"PaddleOCR internal error: {e2}")
-
-        if not result or not result[0]:
-            return OCRResult.failure("No text detected")
-
-        lines = []
-        for line in result[0]:
-            if line and len(line) >= 2:
-                text = (
-                    line[1][0]
-                    if isinstance(line[1], tuple)
-                    else line[1].get("text", "")
-                )
-                if text:
-                    lines.append(text)
-
-        if not lines:
-            return OCRResult.failure("No text lines extracted")
-
-        return OCRResult.success("\n".join(lines))
-
-    except Exception as e:
-        print(f"OCR processing error: {e}")
-        return OCRResult.failure(f"OCR processing error: {e}")
-
-
-def extract_lines_with_prices(raw_text: str) -> List[ExtractedItem]:
-    """
-    Parse raw OCR text and extract item-like lines + prices.
-    Implements vertical line merge logic for wrapped names.
-    """
-    if not raw_text or not raw_text.strip():
+def extract_ocr_tokens(image_path):
+    if not os.path.exists(image_path):
         return []
-
-    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-    results = []
-    pending_name_buffer = []
-
-    # Blocked keywords for fallback parser
-    BLOCKED_RE = re.compile(r'(subtotal|gst|cgst|sgst|tax|service charge|round off|total qty|invoice value)', re.I)
-
-    for ln in lines:
-        # 1. Skip blocked metadata/tax lines
-        if BLOCKED_RE.search(ln):
-            continue
-
-        # 2. Try to find a price/amount
-        m_right = _RIGHTMOST_NUM_RE.search(ln)
-        chosen = m_right.group(1) if m_right else None
+    
+    result, _ = ocr_engine(image_path)
+    tokens = []
+    if not result:
+        return tokens
+    
+    for box, text, score in result:
+        # box is [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+        box_np = np.array(box)
+        x1 = float(np.min(box_np[:, 0]))
+        y1 = float(np.min(box_np[:, 1]))
+        x2 = float(np.max(box_np[:, 0]))
+        y2 = float(np.max(box_np[:, 1]))
         
-        if not chosen:
-            # No price found - might be a wrapped name line
-            if re.search(r'[A-Za-z]', ln):
-                pending_name_buffer.append(ln)
-            continue
+        tokens.append({
+            "text": text,
+            "bbox": [x1, y1, x2, y2]
+        })
+    return tokens
 
-        # 3. Handle line with price
-        price = _normalize_number_token(chosen) # Simplified for fallback
-        if price is None or price <= 0 or price > 1000000:
-            if re.search(r'[A-Za-z]', ln):
-                pending_name_buffer.append(ln)
-            continue
-
-        # 4. Extract description and check for Qty pattern
-        # Pattern: ITEM_NAME QTY AMOUNT
-        line_text = re.sub(re.escape(chosen) + r"\s*$", "", ln).strip()
+def group_tokens_into_lines(tokens, y_tolerance=15):
+    """
+    Groups tokens into lines using y-coordinate clustering.
+    Returns list of dicts with: text, left_x, right_x, y, tokens
+    """
+    if not tokens:
+        return []
+    
+    # Sort tokens by vertical center y-coordinate
+    sorted_tokens = sorted(tokens, key=lambda t: (t['bbox'][1] + t['bbox'][3]) / 2)
+    
+    lines = []
+    current_line = [sorted_tokens[0]]
+    current_y = (sorted_tokens[0]['bbox'][1] + sorted_tokens[0]['bbox'][3]) / 2
+    
+    for token in sorted_tokens[1:]:
+        token_y = (token['bbox'][1] + token['bbox'][3]) / 2
+        if abs(token_y - current_y) <= y_tolerance:
+            current_line.append(token)
+            current_y = sum((t['bbox'][1] + t['bbox'][3]) / 2 for t in current_line) / len(current_line)
+        else:
+            lines.append(current_line)
+            current_line = [token]
+            current_y = token_y
+            
+    if current_line:
+        lines.append(current_line)
         
-        # Check for trailing Qty before the amount
-        # e.g. "PARATHA 3 240" -> line_text is "PARATHA 3"
-        qty_match = re.search(r'\s+(\d+)\s*$', line_text)
-        if qty_match:
-            qty = int(qty_match.group(1))
-            line_text = line_text[:qty_match.start()].strip()
-            # If Qty exists, we could calculate unit price, but ExtractedItem schema is simple.
-            # We'll just preserve the clean name.
+    grouped_lines = []
+    for line_tokens in lines:
+        # Sort tokens in the line by x-coordinate (left to right)
+        line_tokens = sorted(line_tokens, key=lambda t: t['bbox'][0])
         
-        # 5. Combine with pending buffer
-        full_name = " ".join(pending_name_buffer + [line_text]).strip()
-        pending_name_buffer = [] # Clear buffer
-
-        # 6. Final cleaning and validation
-        full_name = re.sub(r"^[\s\$\€\₹\£]+", "", full_name).strip()
-        full_name = re.sub(r"^\d+[\.\)\-]\s*", "", full_name).strip()
-
-        # Reject numeric garbage (must contain at least one letter)
-        if not re.search(r'[A-Za-z]', full_name):
-            continue
-
-        item = ExtractedItem(
-            description=full_name if full_name else "Unparsed Item",
-            price=price,
-            is_valid=True,
-            raw_line=ln
-        )
-        results.append(item)
-
-    return results
+        text = " ".join(t['text'] for t in line_tokens)
+        left_x = line_tokens[0]['bbox'][0]
+        right_x = max(t['bbox'][2] for t in line_tokens)
+        y = sum((t['bbox'][1] + t['bbox'][3]) / 2 for t in line_tokens) / len(line_tokens)
+        
+        grouped_lines.append({
+            "text": text,
+            "left_x": left_x,
+            "right_x": right_x,
+            "y": y,
+            "tokens": line_tokens
+        })
+        
+    return grouped_lines

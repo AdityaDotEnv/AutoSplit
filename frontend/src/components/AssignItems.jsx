@@ -69,6 +69,12 @@ export default function AssignItems({ group, bill, onSaved }) {
     }
   }
 
+  const assignedTotal = bill.items.reduce((acc, it) => {
+    const assigned = assignMap[it.id] || [];
+    return assigned.length > 0 ? acc + Number(it.price) : acc;
+  }, 0);
+  const totalBill = bill.items.reduce((acc, it) => acc + Number(it.price), 0);
+
   return (
     <div className="assign-items-section">
       <div className="section-header">
@@ -80,45 +86,55 @@ export default function AssignItems({ group, bill, onSaved }) {
       
       {error && <div className="error-message">{error}</div>}
 
-      <div className="assignments-table">
-        <div className="table-header">
-          <div className="table-col item-col">Item</div>
-          <div className="table-col price-col">Price</div>
-          <div className="table-col assign-col">Assign To</div>
+      <div className="assignment-grid">
+        <div className="assignment-header">
+          <div className="item-col">Item</div>
+          <div className="price-col">Price</div>
+          <div className="assign-col">Assign To</div>
         </div>
         
-        <div className="table-body">
+        <div className="assignment-body">
           {bill.items.map((it) => (
-            <div key={it.id} className="table-row">
-              <div className="table-col item-col">
-                <div className="item-name">{it.description}</div>
+            <div key={it.id} className="assignment-row">
+              <div className="item-col" title={it.description}>
+                {it.description}
               </div>
-              <div className="table-col price-col">
-                <div className="price-tag">₹{Number(it.price).toFixed(2)}</div>
+              <div className="price-col">
+                ₹{Number(it.price).toFixed(2)}
               </div>
-              <div className="table-col assign-col">
-                <div className="member-checkboxes">
-                  {members.map((m) => {
-                    const checked = (assignMap[it.id] || []).includes(m.id);
-                    return (
-                      <label 
-                        key={m.id} 
-                        className={`checkbox-label ${checked ? 'checked' : ''}`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => toggleAssign(it.id, m.id)}
-                          className="checkbox-input"
-                        />
-                        <span className="member-name">{m.name}</span>
-                      </label>
-                    );
-                  })}
-                </div>
+              <div className="assign-col">
+                {members.map((m) => {
+                  const checked = (assignMap[it.id] || []).includes(m.id);
+                  return (
+                    <label 
+                      key={m.id} 
+                      className={`checkbox-label ${checked ? 'checked' : ''}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleAssign(it.id, m.id)}
+                        className="checkbox-input"
+                      />
+                      <span>{m.name}</span>
+                    </label>
+                  );
+                })}
               </div>
             </div>
           ))}
+        </div>
+
+        <div className="assignment-summary-row">
+          <div className="item-col">Assigned Subtotal</div>
+          <div className="price-col">₹{assignedTotal.toFixed(2)}</div>
+          <div className="assign-col">
+            <span className="summary-info">
+              {assignedTotal === totalBill 
+                ? "✅ All items assigned" 
+                : `Remaining: ₹${(totalBill - assignedTotal).toFixed(2)}`}
+            </span>
+          </div>
         </div>
       </div>
 
