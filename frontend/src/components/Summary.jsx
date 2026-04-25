@@ -3,8 +3,8 @@ import API from "../api";
 import { ResponsiveContainer, PieChart, Pie, Tooltip, Legend, Cell } from "recharts";
 
 const COLORS = [
-  "#6366F1", "#22C55E", "#F97316", "#06B6D4", "#E11D48",
-  "#84CC16", "#A855F7", "#F59E0B", "#10B981", "#3B82F6"
+  "#1863dc", "#000000", "#93939f", "#9b60aa", "#d9d9dd",
+  "#c7d2fe", "#4f46e5", "#10b981", "#f59e0b", "#ef4444"
 ];
 
 export default function Summary({ group, refreshToken = 0 }) {
@@ -104,9 +104,14 @@ export default function Summary({ group, refreshToken = 0 }) {
                 <Tooltip 
                   formatter={(value) => [`₹${value}`, 'Amount']}
                   contentStyle={{
-                    background: 'var(--surface)',
-                    border: '1px solid var(--border)',
-                    borderRadius: 'var(--radius)',
+                    background: '#ffffff',
+                    border: '1px solid #f2f2f2',
+                    borderRadius: '12px',
+                    boxShadow: '0 4px 12px rgba(0,0,0,0.05)',
+                  }}
+                  itemStyle={{
+                    color: '#000000',
+                    fontFamily: 'var(--font-body)',
                   }}
                 />
                 <Legend />

@@ -1,150 +1,221 @@
 import re
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field
+
 try:
     import spacy
+
     nlp = spacy.load("en_core_web_sm")
 except Exception:
     nlp = None
 
 _METADATA_KEYWORDS = [
-    "invoice", "invoice no", "invoice#", "bill no", "bill#", "date", "time",
-    "gst", "tax", "subtotal", "amount due", "total due", "amount", "phone",
-    "tel", "mobile", "order no", "qty", "quantity", "id", "paid", "change",
-    "receipt"
+    "invoice",
+    "invoice no",
+    "invoice#",
+    "bill no",
+    "bill#",
+    "date",
+    "time",
+    "gst",
+    "tax",
+    "subtotal",
+    "amount due",
+    "total due",
+    "amount",
+    "phone",
+    "tel",
+    "mobile",
+    "order no",
+    "qty",
+    "quantity",
+    "id",
+    "paid",
+    "change",
+    "receipt",
 ]
 
-# Regex to capture a monetary token (currency optional)
-_AMT_RE = re.compile(r'(?:(?:₹|\$|€|rs\.?|inr)\s*)?([0-9][0-9\.,]{0,20}[0-9])', re.IGNORECASE)
+_AMT_RE = re.compile(
+    r"(?:(?:₹|\$|€|rs\.?|inr)\s*)?([0-9][0-9\.,]{0,20}[0-9])", re.IGNORECASE
+)
 
-def _is_metadata_line(line):
-    low = (line or "").lower()
-    for k in _METADATA_KEYWORDS:
-        if k in low:
-            return True
-    if re.search(r'[/\\\-]{1,}', line) and re.search(r'\d', line):
-        return True
-    if re.search(r'\d{8,}', line):
-        return True
-    return False
 
-def _clean_and_convert_token(tok, context_nums=None):
-    # reuse logic similar to OCR parser but light-weight
-    if tok is None:
+class NullSafeFloat:
+    """Type-safe float wrapper with null handling."""
+
+    __slots__ = ("value", "is_null")
+
+    def __init__(self, value: Any = None):
+        self.is_null = value is None
+        self.value = self._convert(value)
+
+    def _convert(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and (value != value or value == float("inf")):
+                return None
+            return round(float(value), 2)
+        if isinstance(value, str):
+            return self._parse_str(value)
         return None
-    s = tok.strip()
-    s = re.sub(r'[^\d\.,]', '', s)
-    if not s:
-        return None
-    # both separators present?
-    if '.' in s and ',' in s:
-        if s.rfind('.') > s.rfind(','):
-            s = s.replace(',', '')
-        else:
-            s = s.replace('.', '')
-            s = s.replace(',', '.')
-    else:
-        # only comma: decide decimal vs thousand
-        if ',' in s and '.' not in s:
-            parts = s.split(',')
-            if len(parts[-1]) == 2:
-                s = s.replace(',', '.')
-            elif len(parts[-1]) == 3:
-                s = ''.join(parts)
+
+    @staticmethod
+    def _parse_str(s: str) -> Optional[float]:
+        s = s.strip()
+        s = re.sub(r"[^\d\.,]", "", s)
+        if not s:
+            return None
+
+        has_dot = "." in s
+        has_comma = "," in s
+
+        if has_dot and has_comma:
+            if s.rfind(".") > s.rfind(","):
+                s = s.replace(",", "")
             else:
-                s = s.replace(',', '.')
-        # only dot present: if last part >2 digits, remove dots
-        elif '.' in s and ',' not in s:
-            parts = s.split('.')
+                s = s.replace(".", "")
+                s = s.replace(",", ".")
+        elif has_comma and not has_dot:
+            parts = s.split(",")
+            if len(parts[-1]) == 2:
+                s = s.replace(",", ".")
+            elif len(parts[-1]) == 3:
+                s = "".join(parts)
+            else:
+                s = s.replace(",", ".")
+        elif has_dot and not has_comma:
+            parts = s.split(".")
             if len(parts[-1]) > 2:
-                s = ''.join(parts)
+                s = "".join(parts)
 
-    if '.' in s:
         try:
-            return float(s)
+            return round(float(s), 2)
         except:
             return None
 
-    # integer token: decide about /100 heuristic
-    try:
-        val = int(s)
-    except:
+    def get(self) -> Optional[float]:
+        return None if self.is_null else self.value
+
+    def __float__(self) -> float:
+        return 0.0 if self.is_null else self.value
+
+    def __bool__(self) -> bool:
+        return not self.is_null and self.value is not None
+
+
+@dataclass
+class ValidationResult:
+    """Result with validation status."""
+
+    is_valid: bool
+    value: Any = None
+    errors: List[str] = field(default_factory=list)
+
+    @classmethod
+    def ok(cls, value: Any) -> "ValidationResult":
+        return cls(is_valid=True, value=value, errors=[])
+
+    @classmethod
+    def null(cls, error: str) -> "ValidationResult":
+        return cls(is_valid=False, value=None, errors=[error])
+
+    @classmethod
+    def invalid(cls, error: str) -> "ValidationResult":
+        return cls(is_valid=False, value=None, errors=[error])
+
+
+def _is_metadata_line(line: str) -> bool:
+    if not line:
+        return False
+    low = line.lower()
+    for k in _METADATA_KEYWORDS:
+        if k in low:
+            return True
+    if re.search(r"[/\\\-]{1,}", line) and re.search(r"\d", line):
+        return True
+    if re.search(r"\d{8,}", line):
+        return True
+    return False
+
+
+def _sanitize_description(text: str) -> Optional[str]:
+    if not text or not isinstance(text, str):
         return None
+    s = text.strip()
+    s = re.sub(r"^[\s\$\€\₹\£]+", "", s)
+    s = re.sub(r"^\d+[\.\)\-]\s*", "", s)
+    s = s.strip()
+    if len(s) < 1:
+        return None
+    return s if len(s) <= 500 else s[:500]
 
-    if len(s) >= 5:
-        return float(val) / 100.0
-    # if context shows decimals present, apply /100 on 4-digit tokens
-    if context_nums and any(isinstance(x, float) and not x.is_integer() for x in context_nums):
-        if len(s) >= 4:
-            return float(val) / 100.0
 
-    return float(val)
-
-def find_total_amount(raw_text):
+def find_total_amount(raw_text: str) -> ValidationResult:
     """
     Heuristic: scan for lines containing 'total' or similar keywords.
-    If not found, scan last numeric-like lines and choose the largest plausible monetary value.
-    Returns float or None.
+    Returns ValidationResult with validated total or null error.
     """
-    if not raw_text:
-        return None
+    if not raw_text or not raw_text.strip():
+        return ValidationResult.null("Empty or None raw_text")
 
     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-    # lowercase version for keyword scanning
-    low_lines = [l.lower() for l in lines]
+    if not lines:
+        return ValidationResult.null("No valid lines in text")
 
-    # gather obvious numeric tokens for context (presence of decimals)
     context_tokens = []
     for ln in lines:
         for m in _AMT_RE.finditer(ln):
             context_tokens.append(m.group(1))
+
     context_numbers = []
     for tok in context_tokens:
-        if '.' in tok:
-            try:
-                context_numbers.append(float(tok.replace(',', '')))
-            except:
-                pass
+        if "." in tok:
+            parsed = NullSafeFloat(tok)
+            if parsed.value is not None:
+                context_numbers.append(parsed.value)
 
-    # 1) Look for explicit total keywords
-    total_kw_re = re.compile(r'(total|amount due|amount payable|amount)\s*[:\-]?\s*([0-9][0-9\.,]{0,20}[0-9])', re.IGNORECASE)
-    for ln in reversed(lines[-12:]):  # look near the end
-        if _is_metadata_line(ln) and ('total' not in ln.lower()):
-            # metadata with no total mention -> skip
+    total_kw_re = re.compile(
+        r"(total|amount due|amount payable|amount)\s*[:\-]?\s*([0-9][0-9\.,]{0,20}[0-9])",
+        re.IGNORECASE,
+    )
+
+    for ln in reversed(lines[-12:]):
+        if _is_metadata_line(ln) and "total" not in ln.lower():
             continue
         m = total_kw_re.search(ln)
         if m:
             raw_tok = m.group(2)
-            total = _clean_and_convert_token(raw_tok, context_numbers)
-            if total is not None and total > 0:
-                return round(total, 2)
+            total = NullSafeFloat(raw_tok)
+            if total.value is not None and total.value > 0:
+                return ValidationResult.ok(total.value)
 
-    # 2) If explicit total not found, pick the largest numeric-like value from the last few lines
     candidates = []
-    for ln in reversed(lines[-20:]):  # search last 20 lines
+    for ln in reversed(lines[-20:]):
         if _is_metadata_line(ln):
             continue
         for m in _AMT_RE.finditer(ln):
-            val = _clean_and_convert_token(m.group(1), context_numbers)
-            if val is not None and 0 < val < 10000000:
-                candidates.append((val, ln))
+            val = NullSafeFloat(m.group(1))
+            if val.value is not None and 0 < val.value < 10000000:
+                candidates.append((val.value, ln))
 
-    if candidates:
-        # pick the maximum candidate under the assumption total is usually the highest price
-        cand_sorted = sorted(candidates, key=lambda x: x[0], reverse=True)
-        # provide a sanity: if the top candidate is more than 20x the second candidate, it might be erroneous
-        if len(cand_sorted) >= 2:
-            top, second = cand_sorted[0][0], cand_sorted[1][0]
-            if second > 0 and top / second > 50:
-                # suspicious: fallback to second
-                return round(second, 2)
-        return round(cand_sorted[0][0], 2)
+    if not candidates:
+        return ValidationResult.null("No valid total candidates found")
 
-    return None
+    cand_sorted = sorted(candidates, key=lambda x: x[0], reverse=True)
+    if len(cand_sorted) >= 2:
+        top, second = cand_sorted[0][0], cand_sorted[1][0]
+        if second > 0 and top / second > 50:
+            return ValidationResult.ok(second)
+
+    return ValidationResult.ok(cand_sorted[0][0])
 
 
-def detect_person_item_relations(items, raw_text):
+def detect_person_item_relations(
+    items: List[dict], raw_text: str
+) -> Dict[int, List[str]]:
     """
-    Given items (list of dicts with keys 'description' and 'raw_line') and the entire raw_text,
-    try to match person names to items. Returns dict mapping item_index -> [names]
+    Match person names to items. Returns dict mapping item_index -> [names]
     """
     if not raw_text or not items:
         return {}
@@ -152,19 +223,16 @@ def detect_person_item_relations(items, raw_text):
     text = raw_text
     persons = []
 
-    # Use spaCy to extract PERSONs if available
     if nlp:
         try:
             doc = nlp(text)
             persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
         except Exception:
             persons = []
-    # fallback: simple capitalized word sequences as candidate names
+
     if not persons:
-        # find probable names: sequences of 1-3 capitalized words
-        for m in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b', text):
+        for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b", text):
             candidate = m.group(1).strip()
-            # small filter: avoid country/city words by length and presence in metadata
             if len(candidate) > 1 and not _is_metadata_line(candidate):
                 persons.append(candidate)
 
@@ -173,22 +241,21 @@ def detect_person_item_relations(items, raw_text):
 
     for i, it in enumerate(items):
         assigned = []
-        raw_line = (it.get('raw_line') or '').lower()
-        # Search for person names in the same raw_line (exact word match)
+        raw_line = (it.get("raw_line") or "").lower()
+
         for name in persons:
             if not name or len(name.strip()) < 2:
                 continue
-            # match whole words
-            if re.search(r'\b' + re.escape(name.lower()) + r'\b', raw_line):
+            if re.search(r"\b" + re.escape(name.lower()) + r"\b", raw_line):
                 assigned.append(name)
                 continue
-            # else check nearby context: find the raw_line in the full text, then check +-80 chars
             idx = lower_text.find(raw_line)
             if idx != -1:
-                span = lower_text[max(0, idx - 80): idx + 80 + len(raw_line)]
-                if re.search(r'\b' + re.escape(name.lower()) + r'\b', span):
+                span = lower_text[max(0, idx - 80) : idx + 80 + len(raw_line)]
+                if re.search(r"\b" + re.escape(name.lower()) + r"\b", span):
                     assigned.append(name)
+
         if assigned:
-            # dedupe names
             assignments[i] = list(dict.fromkeys(assigned))
+
     return assignments

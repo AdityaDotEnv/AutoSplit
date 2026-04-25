@@ -1,244 +1,377 @@
-from PIL import Image, ImageFilter, ImageOps
 import os
-import pytesseract
 import re
-import math
+from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass, field
 
-# Use environment variable if present (Docker/Linux)
-pytesseract.pytesseract.tesseract_cmd = os.environ.get(
-    "TESSERACT_CMD",
-    pytesseract.pytesseract.tesseract_cmd
-)
+import cv2
+import numpy as np
+import paddle
+from PIL import Image
 
-# 🪟 Optional fallback for local Windows dev only
-# (comment this out or leave as-is if you still run locally on Windows)
-# LOCAL_TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-# if os.path.exists(LOCAL_TESSERACT_PATH):
-#     pytesseract.pytesseract.tesseract_cmd = LOCAL_TESSERACT_PATH
-# else:
-#     print("⚠️ Warning: Tesseract executable not found locally — using default or Docker path")
+# Fix for OneDnnContext error on Windows - must be set before OCR initialization
+os.environ["PADDLE_WITH_MKLDNN"] = "OFF"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_onednn_fused_op"] = "0"
 
-# Heuristics: keywords that indicate a line is metadata (not an item line)
 _METADATA_KEYWORDS = [
-    "invoice", "invoice no", "invoice#", "bill no", "bill#", "date", "time",
-    "gst", "tax", "subtotal", "total due", "amount due", "amount", "phone",
-    "tel", "mobile", "order no", "order#", "qty", "quantity", "id", "cash",
-    "card", "paid", "change", "receipt", "taxable", "vat", "tin", "gstin",
-    "merchant", "address", "email"
+    "invoice",
+    "invoice no",
+    "invoice#",
+    "bill no",
+    "bill#",
+    "date",
+    "time",
+    "gst",
+    "tax",
+    "subtotal",
+    "total due",
+    "amount due",
+    "amount",
+    "phone",
+    "tel",
+    "mobile",
+    "order no",
+    "order#",
+    "qty",
+    "quantity",
+    "id",
+    "cash",
+    "card",
+    "paid",
+    "change",
+    "receipt",
+    "taxable",
+    "vat",
+    "tin",
+    "gstin",
+    "merchant",
+    "address",
+    "email",
 ]
 
-# Flexible regex to find monetary-like tokens. We allow dots and commas and optional currency sign.
-_NUM_TOKEN_RE = re.compile(r'(?P<sym>₹|\$|€|Rs\.?|INR)?\s*(?P<num>[0-9][0-9\.,]{0,20}[0-9])')
+_NUM_TOKEN_RE = re.compile(
+    r"(?P<sym>₹|\$|€|Rs\.?|INR)?\s*(?P<num>[0-9][0-9\.,]{0,20}[0-9])"
+)
+_RIGHTMOST_NUM_RE = re.compile(r"([0-9][0-9\.,]{0,20}[0-9])\s*$")
 
-# Price candidate at line end (rightmost number is usually price)
-_RIGHTMOST_NUM_RE = re.compile(r'([0-9][0-9\.,]{0,20}[0-9])\s*$')
+_ocr = None
 
-# Helper: check line for metadata-like markers
-def _is_metadata_line(line):
+
+def _get_ocr():
+    global _ocr
+    if _ocr is None:
+        try:
+            from paddleocr import PaddleOCR
+
+            _ocr = PaddleOCR(
+                use_angle_cls=True,
+                lang="en",
+                use_gpu=False,
+                show_log=False,
+                enable_mkldnn=False,
+            )
+        except Exception as e:
+            print(f"Failed to initialize PaddleOCR: {e}")
+            import traceback
+            traceback.print_exc()
+            _ocr = False
+    return _ocr
+
+
+@dataclass
+class OCRResult:
+    """OCR result with null safety."""
+
+    text: str = ""
+    is_valid: bool = False
+    error: Optional[str] = None
+
+    @classmethod
+    def success(cls, text: str) -> "OCRResult":
+        valid = bool(text and text.strip())
+        return cls(
+            text=text, is_valid=valid, error=None if valid else "Empty OCR result"
+        )
+
+    @classmethod
+    def failure(cls, error: str) -> "OCRResult":
+        return cls(text="", is_valid=False, error=error)
+
+
+@dataclass
+class ExtractedItem:
+    """Schema-validated extracted item."""
+
+    description: str = "(item)"
+    price: Optional[float] = None
+    raw_line: str = ""
+    is_valid: bool = False
+    validation_errors: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ExtractedItem":
+        errors = []
+        desc = data.get("description")
+        price = data.get("price")
+        raw = data.get("raw_line", "")
+
+        if desc is None or not isinstance(desc, str):
+            desc = "(item)"
+        else:
+            desc = cls._sanitize_description(desc)
+            if not desc:
+                errors.append("Invalid description")
+
+        if price is None:
+            errors.append("Price is None")
+        else:
+            price = cls._validate_price(price)
+            if price is None:
+                errors.append("Invalid price value")
+            elif price <= 0 or price > 1000000:
+                errors.append("Price out of range (0-1000000)")
+
+        is_valid = len(errors) == 0 and price is not None
+        return cls(
+            description=desc or "(item)",
+            price=price,
+            raw_line=raw,
+            is_valid=is_valid,
+            validation_errors=errors,
+        )
+
+    @staticmethod
+    def _sanitize_description(text: str) -> Optional[str]:
+        if not text or not isinstance(text, str):
+            return None
+        s = text.strip()
+        s = re.sub(r"^[\s\$\€\₹\£]+", "", s)
+        s = re.sub(r"^\d+[\.\)\-]\s*", "", s)
+        s = s.strip()
+        return s if s else None
+
+    @staticmethod
+    def _validate_price(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            val = float(value)
+            if val <= 0 or val > 1000000:
+                return None
+            return round(val, 2)
+        except (TypeError, ValueError):
+            return None
+
+
+def _is_metadata_line(line: str) -> bool:
+    if not line:
+        return False
     low = line.lower()
     for k in _METADATA_KEYWORDS:
         if k in low:
             return True
-    # if line contains many non-alphanumeric chars or slashes (likely date) treat as metadata
-    if re.search(r'[/\\\-]{1,}', line) and re.search(r'\d', line):
-        # lines like 12/11/2025 or 2025-11-06 are dates -> metadata
+    if re.search(r"[/\\\-]{1,}", line) and re.search(r"\d", line):
         return True
-    # long sequences of digits (>=8) likely phone, gst, invoice ids
-    if re.search(r'\d{8,}', line):
+    if re.search(r"\d{8,}", line):
         return True
     return False
 
-def _normalize_number_token(tok, context_numbers=None):
-    """
-    Normalize the numeric token string to a float value.
-    - Handles comma/dot decimal separators and common thousand separators.
-    - If tok contains both '.' and ',' we infer thousand/decimal based on last separator.
-    - If tok has no decimal marker and is long (>4 digits), can optionally treat last 2 digits as cents
-      if context_numbers indicates other numbers in the receipt use decimals.
-    Returns float or None on failure.
-    """
-    if not tok or not re.search(r'\d', tok):
+
+def _normalize_number_token(
+    tok: str, context_numbers: List[float] = None
+) -> Optional[float]:
+    if not tok or not re.search(r"\d", tok):
         return None
 
     s = tok.strip()
-    # Remove currency symbol and spaces
-    s = re.sub(r'[^\d,.\-]', '', s)
-
-    # If s contains both '.' and ',', decide which is decimal:
-    if '.' in s and ',' in s:
-        # whichever appears last is the decimal separator in many locales
-        if s.rfind('.') > s.rfind(','):
-            dec = '.'
-            thou = ','
-        else:
-            dec = ','
-            thou = '.'
-        s = s.replace(thou, '')
-        s = s.replace(dec, '.')
-    else:
-        # Only one of them (or none)
-        # If comma used and there are exactly 3 digits after comma, it's probably thousand sep (e.g., 1,234)
-        if ',' in s and '.' not in s:
-            parts = s.split(',')
-            if len(parts[-1]) == 2:
-                # treat comma as decimal
-                s = s.replace(',', '.')
-            elif len(parts[-1]) == 3 and len(parts) > 1:
-                # likely thousand separators
-                s = ''.join(parts)
-            else:
-                # ambiguous: prefer comma as decimal only if last part length == 2
-                s = s.replace(',', '.')
-        # If only '.' present, assume standard decimal if last part length <= 2 else thousand separators
-        elif '.' in s and ',' not in s:
-            parts = s.split('.')
-            if len(parts[-1]) <= 2:
-                # decimal point
-                pass
-            else:
-                # could be thousand separators (e.g., 1.234.567) -> remove all dots
-                s = ''.join(parts)
-
-    # Now s should look like digits with optional single '.' decimal
-    s = s.strip('.')
-    if not re.fullmatch(r'\d+(\.\d+)?', s):
-        # fallback: remove anything unexpected
-        s = re.sub(r'[^\d\.]', '', s)
+    s = re.sub(r"[^\d,.\-]", "", s)
     if not s:
         return None
 
-    # If there's a decimal point, parse directly
-    if '.' in s:
+    has_dot = "." in s
+    has_comma = "," in s
+
+    if has_dot and has_comma:
+        if s.rfind(".") > s.rfind(","):
+            s = s.replace(",", "")
+        else:
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+    elif has_comma and not has_dot:
+        parts = s.split(",")
+        if len(parts[-1]) == 2:
+            s = s.replace(",", ".")
+        elif len(parts[-1]) == 3 and len(parts) > 1:
+            s = "".join(parts)
+        else:
+            s = s.replace(",", ".")
+    elif has_dot and not has_comma:
+        parts = s.split(".")
+        if len(parts[-1]) <= 2:
+            pass
+        else:
+            s = "".join(parts)
+
+    s = s.strip(".")
+    if not re.fullmatch(r"\d+(\.\d+)?", s):
+        s = re.sub(r"[^\d\.]", "", s)
+    if not s:
+        return None
+
+    if "." in s:
         try:
-            return float(s)
+            return round(float(s), 2)
         except:
             return None
 
-    # No explicit decimal point: decide if it needs dividing by 100
     try:
         val = int(s)
     except:
         return None
 
-    # Conservative heuristics:
-    # - If length <= 3, treat as integer (e.g., 250 -> 250.00)
-    # - If length == 4: ambiguous (e.g., 1809 could be 18.09 or 1809); prefer integer unless context suggests decimals
-    # - If length >=5: often OCR dropped the decimal; consider /100 if context_numbers shows decimals elsewhere
     length = len(s)
     if length <= 3:
-        return float(val)
-    # If context_numbers (list of floats or tokens) suggests decimal usage (some tokens had decimals), allow /100
+        return round(float(val), 2)
+
     if context_numbers:
-        # if any nearby token had decimals (i.e., floating values), lenient conversion
-        if any(isinstance(x, float) and not float(x).is_integer() for x in context_numbers):
-            return float(val) / 100.0
-    # else, only do auto /100 when very long (>=5 digits) - heuristic for 18099 -> 180.99
+        if any(isinstance(x, float) and not x.is_integer() for x in context_numbers):
+            return round(float(val) / 100.0, 2)
+
     if length >= 5:
-        return float(val) / 100.0
+        return round(float(val) / 100.0, 2)
 
-    # default fallback: keep as integer value
-    return float(val)
+    return round(float(val), 2)
 
 
-def image_to_text(image_path, psm=6, oem=3):
+def image_to_text(image_path: str, psm: int = None, oem: int = None) -> OCRResult:
     """
-    Load image and run Tesseract OCR with lightweight preprocessing.
-    psm = page segmentation mode: default 6 (assume a single uniform block of text)
+    Load image and run PaddleOCR with preprocessing.
+    Returns OCRResult with null-safe handling.
     """
+    if not image_path or not os.path.exists(image_path):
+        return OCRResult.failure("Invalid image path or file not found")
+
     try:
-        img = Image.open(image_path)
+        img = cv2.imread(image_path)
+        if img is None:
+            try:
+                pil_img = Image.open(image_path)
+                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                return OCRResult.failure(f"Cannot read image: {e}")
 
-        # Convert to grayscale, increase contrast, and apply adaptive threshold
-        # to handle photos and scanned receipts similarly.
-        img = img.convert("L")
-        img = img.filter(ImageFilter.SHARPEN)
-        # Adaptive threshold-ish using point (simple): scale to 0/255 based on mid value
-        width, height = img.size
-        # Downscale then upscale can remove noise; do small smoothing instead of heavy operations
-        img = ImageOps.autocontrast(img)
-        # Save memory: do not resize large images drastically (leave Tesseract to handle)
-        text = pytesseract.image_to_string(img, lang='eng', config=f'--oem {oem} --psm {psm}')
-        return text
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        denoised = cv2.fastNlMeansDenoising(
+            gray, None, h=10, templateWindowSize=7, searchWindowSize=21
+        )
+
+        ocr_engine = _get_ocr()
+        if not ocr_engine:
+            return OCRResult.failure("PaddleOCR not available")
+
+        try:
+            result = ocr_engine.ocr(denoised, cls=False)
+        except Exception as e:
+            print(f"OCR failed on denoised image, retrying on original: {e}")
+            try:
+                result = ocr_engine.ocr(img, cls=False)
+            except Exception as e2:
+                print(f"OCR failed on original image as well: {e2}")
+                return OCRResult.failure(f"PaddleOCR internal error: {e2}")
+
+        if not result or not result[0]:
+            return OCRResult.failure("No text detected")
+
+        lines = []
+        for line in result[0]:
+            if line and len(line) >= 2:
+                text = (
+                    line[1][0]
+                    if isinstance(line[1], tuple)
+                    else line[1].get("text", "")
+                )
+                if text:
+                    lines.append(text)
+
+        if not lines:
+            return OCRResult.failure("No text lines extracted")
+
+        return OCRResult.success("\n".join(lines))
+
     except Exception as e:
-        print("❌ OCR Error:", e)
-        return ""
+        print(f"OCR processing error: {e}")
+        return OCRResult.failure(f"OCR processing error: {e}")
 
 
-def extract_lines_with_prices(raw_text):
+def extract_lines_with_prices(raw_text: str) -> List[ExtractedItem]:
     """
     Parse raw OCR text and extract item-like lines + prices.
-    Returns list of dicts: {'description': str, 'price': float, 'raw_line': str}
+    Implements vertical line merge logic for wrapped names.
     """
-    if not raw_text:
+    if not raw_text or not raw_text.strip():
         return []
 
-    # split and keep non-empty lines
     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
     results = []
+    pending_name_buffer = []
 
-    # Pre-scan to see if any explicit decimal tokens exist on receipt ->
-    # used by _normalize_number_token to decide auto /100 behaviour
-    context_number_tokens = []
-    for ln in lines:
-        for m in _NUM_TOKEN_RE.finditer(ln):
-            tok = m.group('num')
-            # quick normalize attempt for context (do not apply /100 here)
-            cleaned = tok.replace(' ', '')
-            cleaned = cleaned.replace('₹', '').replace('Rs', '').replace('INR', '')
-            if ',' in cleaned and '.' in cleaned:
-                # normalize last separator as decimal if ambiguous
-                if cleaned.rfind('.') > cleaned.rfind(','):
-                    cleaned = cleaned.replace(',', '')
-                else:
-                    cleaned = cleaned.replace('.', '')
-                    cleaned = cleaned.replace(',', '.')
-            context_number_tokens.append(cleaned)
-
-    # Convert context tokens to floats where obviously decimals exist
-    context_numbers = []
-    for t in context_number_tokens:
-        if '.' in t:
-            try:
-                context_numbers.append(float(t.replace(',', '')))
-            except:
-                pass
+    # Blocked keywords for fallback parser
+    BLOCKED_RE = re.compile(r'(subtotal|gst|cgst|sgst|tax|service charge|round off|total qty|invoice value)', re.I)
 
     for ln in lines:
-        # skip metadata lines early (dates, invoice ids, phone numbers)
-        if _is_metadata_line(ln):
+        # 1. Skip blocked metadata/tax lines
+        if BLOCKED_RE.search(ln):
             continue
 
-        # prefer the rightmost numeric token in the line (prices are usually to the right)
+        # 2. Try to find a price/amount
         m_right = _RIGHTMOST_NUM_RE.search(ln)
-        chosen = None
-        if m_right:
-            chosen = m_right.group(1)
-        else:
-            # fallback: first numeric token
-            m_any = _NUM_TOKEN_RE.search(ln)
-            if m_any:
-                chosen = m_any.group('num')
-
+        chosen = m_right.group(1) if m_right else None
+        
         if not chosen:
+            # No price found - might be a wrapped name line
+            if re.search(r'[A-Za-z]', ln):
+                pending_name_buffer.append(ln)
             continue
 
-        # normalize chosen token to float using conservative heuristics
-        price = _normalize_number_token(chosen, context_numbers or None)
-        if price is None:
+        # 3. Handle line with price
+        price = _normalize_number_token(chosen) # Simplified for fallback
+        if price is None or price <= 0 or price > 1000000:
+            if re.search(r'[A-Za-z]', ln):
+                pending_name_buffer.append(ln)
             continue
 
-        # Build description by removing the chosen token from the line (rightmost occurrence)
-        # and trimming separators/trailing punctuation.
-        desc = re.sub(re.escape(chosen) + r'\s*$', '', ln).strip()
-        # remove currency symbols that may be in front
-        desc = re.sub(r'^[\s\$\€\₹\£]+', '', desc).strip()
-        # drop leading item numbering/bullets like "1. Pizza"
-        desc = re.sub(r'^\d+[\.\)\-]\s*', '', desc).strip()
+        # 4. Extract description and check for Qty pattern
+        # Pattern: ITEM_NAME QTY AMOUNT
+        line_text = re.sub(re.escape(chosen) + r"\s*$", "", ln).strip()
+        
+        # Check for trailing Qty before the amount
+        # e.g. "PARATHA 3 240" -> line_text is "PARATHA 3"
+        qty_match = re.search(r'\s+(\d+)\s*$', line_text)
+        if qty_match:
+            qty = int(qty_match.group(1))
+            line_text = line_text[:qty_match.start()].strip()
+            # If Qty exists, we could calculate unit price, but ExtractedItem schema is simple.
+            # We'll just preserve the clean name.
+        
+        # 5. Combine with pending buffer
+        full_name = " ".join(pending_name_buffer + [line_text]).strip()
+        pending_name_buffer = [] # Clear buffer
 
-        # final safety: price must be positive and not ridiculously huge
-        if price <= 0 or price > 1000000:
+        # 6. Final cleaning and validation
+        full_name = re.sub(r"^[\s\$\€\₹\£]+", "", full_name).strip()
+        full_name = re.sub(r"^\d+[\.\)\-]\s*", "", full_name).strip()
+
+        # Reject numeric garbage (must contain at least one letter)
+        if not re.search(r'[A-Za-z]', full_name):
             continue
 
-        results.append({'description': desc if desc else '(item)', 'price': round(price, 2), 'raw_line': ln})
+        item = ExtractedItem(
+            description=full_name if full_name else "Unparsed Item",
+            price=price,
+            is_valid=True,
+            raw_line=ln
+        )
+        results.append(item)
 
     return results

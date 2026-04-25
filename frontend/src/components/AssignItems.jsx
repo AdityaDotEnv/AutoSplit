@@ -111,7 +111,6 @@ export default function AssignItems({ group, bill, onSaved }) {
                           onChange={() => toggleAssign(it.id, m.id)}
                           className="checkbox-input"
                         />
-                        <span className="checkbox-custom"></span>
                         <span className="member-name">{m.name}</span>
                       </label>
                     );
