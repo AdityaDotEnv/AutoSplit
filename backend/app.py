@@ -25,6 +25,7 @@ from ocr_parser import (
     ExtractedItem,
 )
 from nlp_parser import find_total_amount, detect_person_item_relations, ValidationResult
+from intelligent_parser import refine_with_gemini
 from payments import create_stripe_payment_intent, venmo_deeplink, upi_deeplink
 
 
@@ -133,10 +134,58 @@ def upload_bill():
             ), 422
 
         raw_text = ocr_result.text
-        items = extract_lines_with_prices(raw_text)
+        total_amount = None
+        
+        # Create a default total_result in case Gemini handles everything
+        class DummyTotalResult:
+            is_valid = True
+            value = None
+            errors = []
+        total_result = DummyTotalResult()
+        
+        # Try intelligent refinement first
+        refined_bill = refine_with_gemini(raw_text)
+        
+        if refined_bill and refined_bill.items:
+            print("Using Gemini-refined bill items")
+            items = []
+            
+            # Blocked keywords for item extraction
+            BLOCKED = {
+                "subtotal", "sub total", "gst", "cgst", "sgst",
+                "tax", "service charge", "staff contribution",
+                "round off", "total", "invoice value", "total qty"
+            }
 
-        total_result = find_total_amount(raw_text)
-        total_amount = total_result.value if total_result.is_valid else None
+            for idx, git in enumerate(refined_bill.items):
+                # Derived name logic
+                derived_name = (git.name or "").strip() or (git.raw_text or "").strip()
+                
+                if not derived_name or derived_name.lower() in {"item", "(item)", "unknown"}:
+                    derived_name = f"Unparsed Item {idx+1}"
+
+                # Skip blocked items (taxes/totals)
+                if derived_name.lower() in BLOCKED:
+                    print(f"Skipping blocked item: {derived_name}")
+                    continue
+
+                items.append(ExtractedItem(
+                    description=derived_name,
+                    price=git.amount,
+                    is_valid=True,
+                    raw_line=git.raw_text or derived_name
+                ))
+            
+            total_amount = refined_bill.totals.grand_total
+            # If Gemini missed the total, fall back to heuristic
+            if total_amount is None:
+                total_result = find_total_amount(raw_text)
+                total_amount = total_result.value if total_result.is_valid else None
+        else:
+            # Fallback to regex logic
+            items = extract_lines_with_prices(raw_text)
+            total_result = find_total_amount(raw_text)
+            total_amount = total_result.value if total_result.is_valid else None
 
         item_dicts = [
             {"description": it.description, "price": it.price, "raw_line": it.raw_line}
@@ -188,6 +237,14 @@ def upload_bill():
         print("Upload error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+    finally:
+        if 'path' in locals() and os.path.exists(path):
+            try:
+                os.remove(path)
+                print(f"Cleaned up {path}")
+            except Exception as e:
+                print(f"Failed to cleanup {path}: {e}")
 
 
 @app.route("/api/assign", methods=["POST"])

@@ -6,3 +6,13 @@ venv/
 
 # Node modules
 node_modules/
+
+# Environment variables
+.env
+
+# Py-Cache
+__pycache__/
+.venv/
+.vscode/
+.idea/
+*.pyc

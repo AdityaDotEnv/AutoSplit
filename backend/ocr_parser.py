@@ -307,69 +307,70 @@ def image_to_text(image_path: str, psm: int = None, oem: int = None) -> OCRResul
 def extract_lines_with_prices(raw_text: str) -> List[ExtractedItem]:
     """
     Parse raw OCR text and extract item-like lines + prices.
-    Returns list of ExtractedItem with validation.
+    Implements vertical line merge logic for wrapped names.
     """
     if not raw_text or not raw_text.strip():
         return []
 
     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
     results = []
+    pending_name_buffer = []
 
-    context_number_tokens = []
-    for ln in lines:
-        for m in _NUM_TOKEN_RE.finditer(ln):
-            tok = m.group("num")
-            cleaned = (
-                tok.replace(" ", "")
-                .replace("₹", "")
-                .replace("Rs", "")
-                .replace("INR", "")
-            )
-            if "," in cleaned and "." in cleaned:
-                if cleaned.rfind(".") > cleaned.rfind(","):
-                    cleaned = cleaned.replace(",", "")
-                else:
-                    cleaned = cleaned.replace(".", "")
-                    cleaned = cleaned.replace(",", ".")
-            context_number_tokens.append(cleaned)
-
-    context_numbers = []
-    for t in context_number_tokens:
-        if "." in t:
-            try:
-                context_numbers.append(float(t.replace(",", "")))
-            except:
-                pass
+    # Blocked keywords for fallback parser
+    BLOCKED_RE = re.compile(r'(subtotal|gst|cgst|sgst|tax|service charge|round off|total qty|invoice value)', re.I)
 
     for ln in lines:
-        if _is_metadata_line(ln):
+        # 1. Skip blocked metadata/tax lines
+        if BLOCKED_RE.search(ln):
             continue
 
+        # 2. Try to find a price/amount
         m_right = _RIGHTMOST_NUM_RE.search(ln)
-        chosen = None
-        if m_right:
-            chosen = m_right.group(1)
-        else:
-            m_any = _NUM_TOKEN_RE.search(ln)
-            if m_any:
-                chosen = m_any.group("num")
-
+        chosen = m_right.group(1) if m_right else None
+        
         if not chosen:
+            # No price found - might be a wrapped name line
+            if re.search(r'[A-Za-z]', ln):
+                pending_name_buffer.append(ln)
             continue
 
-        price = _normalize_number_token(chosen, context_numbers)
-        if price is None:
+        # 3. Handle line with price
+        price = _normalize_number_token(chosen) # Simplified for fallback
+        if price is None or price <= 0 or price > 1000000:
+            if re.search(r'[A-Za-z]', ln):
+                pending_name_buffer.append(ln)
             continue
 
-        desc = re.sub(re.escape(chosen) + r"\s*$", "", ln).strip()
-        desc = re.sub(r"^[\s\$\€\₹\£]+", "", desc).strip()
-        desc = re.sub(r"^\d+[\.\)\-]\s*", "", desc).strip()
+        # 4. Extract description and check for Qty pattern
+        # Pattern: ITEM_NAME QTY AMOUNT
+        line_text = re.sub(re.escape(chosen) + r"\s*$", "", ln).strip()
+        
+        # Check for trailing Qty before the amount
+        # e.g. "PARATHA 3 240" -> line_text is "PARATHA 3"
+        qty_match = re.search(r'\s+(\d+)\s*$', line_text)
+        if qty_match:
+            qty = int(qty_match.group(1))
+            line_text = line_text[:qty_match.start()].strip()
+            # If Qty exists, we could calculate unit price, but ExtractedItem schema is simple.
+            # We'll just preserve the clean name.
+        
+        # 5. Combine with pending buffer
+        full_name = " ".join(pending_name_buffer + [line_text]).strip()
+        pending_name_buffer = [] # Clear buffer
 
-        if price <= 0 or price > 1000000:
+        # 6. Final cleaning and validation
+        full_name = re.sub(r"^[\s\$\€\₹\£]+", "", full_name).strip()
+        full_name = re.sub(r"^\d+[\.\)\-]\s*", "", full_name).strip()
+
+        # Reject numeric garbage (must contain at least one letter)
+        if not re.search(r'[A-Za-z]', full_name):
             continue
 
-        item = ExtractedItem.from_dict(
-            {"description": desc if desc else "(item)", "price": price, "raw_line": ln}
+        item = ExtractedItem(
+            description=full_name if full_name else "Unparsed Item",
+            price=price,
+            is_valid=True,
+            raw_line=ln
         )
         results.append(item)
 
