@@ -16,3 +16,7 @@ __pycache__/
 .vscode/
 .idea/
 *.pyc
+
+# Local Data & Uploads
+*.db
+backend/uploads/
