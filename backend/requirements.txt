@@ -13,9 +13,9 @@ numpy==1.24.4          # <-- pin to avoid NumPy 2.x ABI break
 spacy==3.6.0
 thinc==8.1.12          # <-- compatible with spaCy 3.6
 Pillow>= 10.0.0
-opencv-python<=4.6.0.66
-paddleocr==2.7.3
-paddlepaddle>=2.5.2
+opencv-python-headless
+rapidocr-onnxruntime
+rapidfuzz
 # Config / web
 python-dotenv==1.0.0
 gunicorn==20.1.0

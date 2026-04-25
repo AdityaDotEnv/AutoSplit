@@ -1,12 +1,9 @@
 import os
 import traceback
-import paddle
+import traceback
 from datetime import datetime, timedelta
 
-# Enforce Paddle stability flags before other imports
-os.environ["PADDLE_WITH_MKLDNN"] = "OFF"
-os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["FLAGS_enable_onednn_fused_op"] = "0"
+# Enforce stability flags if needed, but Paddle is removed
 from collections import defaultdict
 from typing import Optional, List, Dict, Any
 
@@ -18,13 +15,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from models import db, Group, Member, Bill, Item, ItemAssignment
 from config import Config
-from ocr_parser import (
-    image_to_text,
-    extract_lines_with_prices,
-    OCRResult,
-    ExtractedItem,
-)
-from nlp_parser import find_total_amount, detect_person_item_relations, ValidationResult
+from ocr_parser import extract_ocr_tokens, group_tokens_into_lines
+from receipt_parser import parse_receipt
+from reconcile import reconcile
+from nlp_parser import detect_person_item_relations
 from intelligent_parser import refine_with_gemini
 from payments import create_stripe_payment_intent, venmo_deeplink, upi_deeplink
 
@@ -123,73 +117,73 @@ def upload_bill():
         path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         f.save(path)
 
-        ocr_result = image_to_text(path)
-        if not ocr_result.is_valid or not ocr_result.text:
-            print(f"OCR Failed for {filename}. Error: {ocr_result.error}")
+        ocr_tokens = extract_ocr_tokens(path)
+        if not ocr_tokens:
+            print(f"OCR Failed for {filename}. No text detected.")
             return jsonify(
                 {
                     "error": "OCR failed",
-                    "details": ocr_result.error or "No text detected",
+                    "details": "No text detected",
                 }
             ), 422
 
-        raw_text = ocr_result.text
-        total_amount = None
-        
-        # Create a default total_result in case Gemini handles everything
-        class DummyTotalResult:
-            is_valid = True
-            value = None
-            errors = []
-        total_result = DummyTotalResult()
-        
-        # Try intelligent refinement first
-        refined_bill = refine_with_gemini(raw_text)
-        
-        if refined_bill and refined_bill.items:
-            print("Using Gemini-refined bill items")
-            items = []
-            
-            # Blocked keywords for item extraction
-            BLOCKED = {
-                "subtotal", "sub total", "gst", "cgst", "sgst",
-                "tax", "service charge", "staff contribution",
-                "round off", "total", "invoice value", "total qty"
-            }
+        lines = group_tokens_into_lines(ocr_tokens)
+        parsed_receipt = parse_receipt(lines)
+        recon = reconcile(parsed_receipt)
 
-            for idx, git in enumerate(refined_bill.items):
-                # Derived name logic
-                derived_name = (git.name or "").strip() or (git.raw_text or "").strip()
+        raw_text = "\n".join(l['text'] for l in lines)
+        total_amount = recon['calculated_total'] if recon['stated_total'] is None else recon['stated_total']
+
+        items_for_db = []
+        if not recon['reconciled']:
+            print("Reconciliation failed, falling back to Gemini repair")
+            # Try intelligent refinement
+            refined_bill = refine_with_gemini(raw_text)
+            
+            if refined_bill and refined_bill.items:
+                print("Using Gemini-refined bill items")
+                # Blocked keywords for item extraction
+                BLOCKED = {
+                    "subtotal", "sub total", "gst", "cgst", "sgst",
+                    "tax", "service charge", "staff contribution",
+                    "round off", "total", "invoice value", "total qty"
+                }
+
+                for idx, git in enumerate(refined_bill.items):
+                    derived_name = (git.name or "").strip() or (git.raw_text or "").strip()
+                    
+                    if not derived_name or derived_name.lower() in {"item", "(item)", "unknown"}:
+                        derived_name = f"Unparsed Item {idx+1}"
+
+                    if derived_name.lower() in BLOCKED:
+                        continue
+
+                    items_for_db.append({
+                        "description": derived_name,
+                        "price": git.amount,
+                        "is_valid": True,
+                        "raw_line": git.raw_text or derived_name,
+                        "validation_errors": []
+                    })
                 
-                if not derived_name or derived_name.lower() in {"item", "(item)", "unknown"}:
-                    derived_name = f"Unparsed Item {idx+1}"
-
-                # Skip blocked items (taxes/totals)
-                if derived_name.lower() in BLOCKED:
-                    print(f"Skipping blocked item: {derived_name}")
-                    continue
-
-                items.append(ExtractedItem(
-                    description=derived_name,
-                    price=git.amount,
-                    is_valid=True,
-                    raw_line=git.raw_text or derived_name
-                ))
-            
-            total_amount = refined_bill.totals.grand_total
-            # If Gemini missed the total, fall back to heuristic
-            if total_amount is None:
-                total_result = find_total_amount(raw_text)
-                total_amount = total_result.value if total_result.is_valid else None
-        else:
-            # Fallback to regex logic
-            items = extract_lines_with_prices(raw_text)
-            total_result = find_total_amount(raw_text)
-            total_amount = total_result.value if total_result.is_valid else None
+                if refined_bill.totals and refined_bill.totals.grand_total:
+                    total_amount = refined_bill.totals.grand_total
+        
+        if not items_for_db:
+            # Use deterministic parser result
+            for item in parsed_receipt.items:
+                if item.amount is not None:
+                    items_for_db.append({
+                        "description": item.name,
+                        "price": item.amount,
+                        "is_valid": True,
+                        "raw_line": item.name,
+                        "validation_errors": []
+                    })
 
         item_dicts = [
-            {"description": it.description, "price": it.price, "raw_line": it.raw_line}
-            for it in items
+            {"description": it["description"], "price": it["price"], "raw_line": it["raw_line"]}
+            for it in items_for_db
         ]
         parsed_assignments = detect_person_item_relations(item_dicts, raw_text)
 
@@ -199,15 +193,12 @@ def upload_bill():
 
         db_items = []
         valid_item_count = 0
-        for it in items:
-            if it.is_valid and it.price is not None:
-                item = Item(bill_id=bill.id, description=it.description, price=it.price)
-                db.session.add(item)
-                db.session.flush()
-                db_items.append(item)
-                valid_item_count += 1
-            else:
-                db_items.append(None) # Placeholder for invalid items
+        for it in items_for_db:
+            item = Item(bill_id=bill.id, description=it["description"], price=it["price"])
+            db.session.add(item)
+            db.session.flush()
+            db_items.append(item)
+            valid_item_count += 1
 
         db.session.commit()
 
@@ -216,17 +207,17 @@ def upload_bill():
                 "bill_id": bill.id,
                 "raw_text": raw_text,
                 "total": total_amount,
-                "total_valid": total_result.is_valid,
-                "total_error": total_result.errors[0] if total_result.errors else None,
+                "total_valid": True,
+                "total_error": None,
                 "items": [
                     {
                         "id": db_item.id if db_item else None,
-                        "description": it.description,
-                        "price": it.price,
-                        "is_valid": it.is_valid,
-                        "validation_errors": it.validation_errors,
+                        "description": it["description"],
+                        "price": it["price"],
+                        "is_valid": it["is_valid"],
+                        "validation_errors": it["validation_errors"],
                     }
-                    for it, db_item in zip(items, db_items)
+                    for it, db_item in zip(items_for_db, db_items)
                 ],
                 "valid_item_count": valid_item_count,
                 "auto_matches": parsed_assignments,
